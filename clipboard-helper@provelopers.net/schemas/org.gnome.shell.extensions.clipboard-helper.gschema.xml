@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.clipboard-helper" path="/org/gnome/shell/extensions/clipboard-helper/">
+    <key name="show-panel" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Open the Clipboard panel</summary>
+      <description>The keyboard shortcut that opens the Clipboard panel over any app. Empty by default: it is set only when the user chooses a shortcut in the Clipboard app.</description>
+    </key>
+  </schema>
+</schemalist>
