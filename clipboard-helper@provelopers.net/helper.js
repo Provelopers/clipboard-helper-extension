@@ -1,25 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Provelopers
 
-// The Clipboard app's helper inside GNOME Shell.
-//
-// Wayland does not let an ordinary app read the clipboard while another app is
-// in front, hold a shortcut for the whole desktop, bring its own window to the
-// front, or type into another app. The shell can do all of these, so this
-// object does them on the app's behalf and talks to it over D-Bus:
-//
-//   - every copy is announced (ClipboardChanged), and the app reads the parts
-//     it wants (ReadClipboard); the app writes the clipboard the same way;
-//   - the shortcut the user chooses in the app (none until then) is announced as ShortcutPressed,
-//     with a token that lets the app's panel take the focus;
-//   - the app that was in front is remembered, and Paste gives it the focus
-//     back and presses its paste keys;
-//   - the panel window is kept above other windows and placed on the screen
-//     with the pointer.
-//
-// Only the running Clipboard app may read or write the clipboard or paste:
-// every such call is checked against the D-Bus name the app holds
-// (com.provelopers.Clipboard.App).
+// Wayland does not let an app read the clipboard in the background, hold a
+// desktop-wide shortcut, or type into another app. The shell can, so this
+// object does those for the Clipboard app and talks to it over D-Bus. Only the
+// holder of the app's bus name may read or write the clipboard or paste.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -31,13 +16,15 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 export const APP_ID = 'com.provelopers.Clipboard';
-/** The name the app's D-Bus connection to this helper holds while it runs. */
 export const APP_BUS_NAME = 'com.provelopers.Clipboard.App';
 export const BUS_NAME = 'com.provelopers.Clipboard.Helper';
 export const OBJECT_PATH = '/com/provelopers/Clipboard/Helper';
-export const PROTOCOL_VERSION = 1;
+// A sandboxed (snap) app cannot call the helper, so the helper calls this
+// object of the app's to fetch its requests.
+export const APP_OBJECT_PATH = '/com/provelopers/Clipboard/App';
+export const APP_INTERFACE = 'com.provelopers.Clipboard.App1';
+export const PROTOCOL_VERSION = 2;
 
-/** The panel's window title; the app's other windows (editor, welcome screens) have their own. */
 const PANEL_TITLE = 'Clipboard';
 
 const INTERFACE_XML = `
@@ -93,13 +80,10 @@ const INTERFACE_XML = `
   </interface>
 </node>`;
 
-/** How long after the app writes the clipboard the change it causes is still its own. */
+// A clipboard change this soon after the app's own write is not a new copy.
 const OWN_WRITE_MS = 1000;
-
-/** How long Paste waits for the app it pastes into to take the focus. */
 const FOCUS_WAIT_MS = 600;
 
-/** Keys a paste may press, by the names the app sends ("ctrl+shift+v"). */
 const KEYVALS = {
     ctrl: Clutter.KEY_Control_L,
     shift: Clutter.KEY_Shift_L,
@@ -109,7 +93,7 @@ const KEYVALS = {
     v: Clutter.KEY_v,
 };
 
-/** The keyvals of "ctrl+shift+v", or null when any part is not one the helper presses. */
+// "ctrl+shift+v" to keyvals; null when a part is not in KEYVALS.
 export function parseKeys(keys) {
     const parts = String(keys).toLowerCase().split('+').map(part => part.trim());
     if (parts.length === 0 || parts.some(part => !(part in KEYVALS))) return null;
@@ -117,11 +101,12 @@ export function parseKeys(keys) {
 }
 
 export class ClipboardHelper {
-    constructor(settings, {onAppRunningChanged, onMenuState} = {}) {
+    constructor(settings, {onAppRunningChanged, onMenuState}) {
         this._settings = settings;
-        this._onAppRunningChanged = onAppRunningChanged ?? (() => {});
-        this._onMenuState = onMenuState ?? (() => {});
+        this._onAppRunningChanged = onAppRunningChanged;
+        this._onMenuState = onMenuState;
         this._appOwner = null;
+        this._asking = null;
         this._lastTarget = null;
         this._lastTargetUnmanagedId = 0;
         this._ownWriteUntil = 0;
@@ -129,8 +114,6 @@ export class ClipboardHelper {
         this._signals = [];
         this._timeouts = new Set();
         this._virtualKeyboard = null;
-        // Whether the window that had the focus last was the app's own, so a move
-        // to another app can be told from the panel keeping its own focus.
         this._focusWasOurs = false;
     }
 
@@ -143,7 +126,6 @@ export class ClipboardHelper {
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
         this._nameId = Gio.bus_own_name_on_connection(
             Gio.DBus.session, BUS_NAME, Gio.BusNameOwnerFlags.NONE, null, null);
-        // The app holds its name on the bus while it runs.
         this._watchId = Gio.bus_watch_name_on_connection(
             Gio.DBus.session, APP_BUS_NAME, Gio.BusNameWatcherFlags.NONE,
             (_connection, _name, owner) => this._setAppOwner(owner),
@@ -170,18 +152,14 @@ export class ClipboardHelper {
         for (const id of this._timeouts) GLib.source_remove(id);
         this._timeouts.clear();
         this._forgetTarget();
-        if (this._watchId) Gio.bus_unwatch_name(this._watchId);
-        if (this._nameId) Gio.bus_unown_name(this._nameId);
-        this._dbus?.unexport();
+        this._stopAsking();
+        Gio.bus_unwatch_name(this._watchId);
+        Gio.bus_unown_name(this._nameId);
+        this._dbus.unexport();
         this._dbus = null;
-        // A virtual input device stays registered with the compositor until it is
-        // disposed; waiting for garbage collection would leave a stray keyboard
-        // behind after the extension is turned off.
-        this._virtualKeyboard?.run_dispose();
         this._virtualKeyboard = null;
     }
 
-    /** Wait, with the timer removed in destroy() if the helper is turned off meanwhile. */
     _sleep(ms) {
         return new Promise(resolve => {
             const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
@@ -193,14 +171,12 @@ export class ClipboardHelper {
         });
     }
 
-    /** Connect a signal that destroy() disconnects if it is still connected then. */
     _connect(object, signal, handler) {
         const id = object.connect(signal, handler);
         this._signals.push([object, id]);
         return id;
     }
 
-    /** Disconnect a signal connected with _connect before destroy(). */
     _disconnect(object, id) {
         object.disconnect(id);
         this._signals = this._signals.filter(([other, otherId]) => other !== object || otherId !== id);
@@ -208,11 +184,14 @@ export class ClipboardHelper {
 
     _setAppOwner(owner) {
         const wasRunning = this.appRunning;
+        if (owner !== this._appOwner) {
+            this._stopAsking();
+            if (owner !== null) this._startAsking();
+        }
         this._appOwner = owner;
         if (wasRunning !== this.appRunning) this._onAppRunningChanged(this.appRunning);
     }
 
-    /** Whether a call comes from the running Clipboard app. */
     _fromApp(invocation) {
         if (this._appOwner !== null && invocation.get_sender() === this._appOwner) return true;
         invocation.return_dbus_error('com.provelopers.Clipboard.Helper.Error.NotAllowed',
@@ -222,24 +201,20 @@ export class ClipboardHelper {
 
     _isOurs(window) {
         if (!window) return false;
-        return window.get_gtk_application_id?.() === APP_ID || window.get_wm_class() === APP_ID;
+        return window.get_gtk_application_id() === APP_ID || window.get_wm_class() === APP_ID;
     }
-
-    // ---- The clipboard --------------------------------------------------------
 
     _onOwnerChanged(type, source) {
         if (type !== Meta.SelectionType.SELECTION_CLIPBOARD || !source) return;
-        // Copies are announced only to the Clipboard app, and only while it runs.
         if (!this.appRunning) return;
-        // The app's own write (a paste, or Copy): not a new copy.
         if (GLib.get_monotonic_time() / 1000 < this._ownWriteUntil) {
             this._ownWriteUntil = 0;
             return;
         }
-        const mimeTypes = source.get_mimetypes() ?? [];
+        const mimeTypes = source.get_mimetypes();
         if (mimeTypes.length === 0) return;
         const app = Shell.WindowTracker.get_default().focus_app;
-        this._dbus?.emit_signal('ClipboardChanged', new GLib.Variant('(asss)', [
+        this._dbus.emit_signal('ClipboardChanged', new GLib.Variant('(asss)', [
             mimeTypes, app?.get_id() ?? '', app?.get_name() ?? '',
         ]));
     }
@@ -248,45 +223,55 @@ export class ClipboardHelper {
         return PROTOCOL_VERSION;
     }
 
+    _read(mimeType) {
+        return new Promise(resolve => {
+            St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimeType, (_clipboard, bytes) => {
+                // St frees these bytes when the callback returns, so copy them
+                // now; bytes is null when the format is not on the clipboard.
+                resolve(new GLib.Bytes(bytes?.get_data() ?? new Uint8Array(0)));
+            });
+        });
+    }
+
+    _write(mimeType, data) {
+        this._ownWriteUntil = GLib.get_monotonic_time() / 1000 + OWN_WRITE_MS;
+        St.Clipboard.get_default().set_content(St.ClipboardType.CLIPBOARD, mimeType, new GLib.Bytes(data));
+    }
+
+    _clear() {
+        this._ownWriteUntil = GLib.get_monotonic_time() / 1000 + OWN_WRITE_MS;
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, '');
+    }
+
     ReadClipboardAsync([mimeType], invocation) {
         if (!this._fromApp(invocation)) return;
-        St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimeType, (_clipboard, bytes) => {
-            const data = bytes ?? new GLib.Bytes(new Uint8Array(0));
-            invocation.return_value(GLib.Variant.new_tuple([
-                GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), data, true),
-            ]));
-        });
+        this._read(mimeType).then(data => invocation.return_value(GLib.Variant.new_tuple([
+            GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), data, true),
+        ])));
     }
 
     WriteClipboardAsync([mimeType, data], invocation) {
         if (!this._fromApp(invocation)) return;
-        this._ownWriteUntil = GLib.get_monotonic_time() / 1000 + OWN_WRITE_MS;
-        St.Clipboard.get_default().set_content(St.ClipboardType.CLIPBOARD, mimeType, new GLib.Bytes(data));
+        this._write(mimeType, data);
         invocation.return_value(null);
     }
 
     ClearClipboardAsync(_parameters, invocation) {
         if (!this._fromApp(invocation)) return;
-        this._ownWriteUntil = GLib.get_monotonic_time() / 1000 + OWN_WRITE_MS;
-        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, '');
+        this._clear();
         invocation.return_value(null);
     }
-
-    // ---- The app to paste into ------------------------------------------------
 
     _onFocusChanged() {
         const window = global.display.focus_window;
         const wasOurs = this._focusWasOurs;
         this._focusWasOurs = this._isOurs(window);
         if (!window || this._focusWasOurs) return;
-        // Somewhere to paste: an app's window, not the shell's own surfaces.
         const type = window.get_window_type();
         if (type !== Meta.WindowType.NORMAL && type !== Meta.WindowType.DIALOG &&
             type !== Meta.WindowType.MODAL_DIALOG) return;
-        // The panel had the focus and another app now has it: the app steps the
-        // panel aside, as on the Mac and Windows. A menu or a drag keeps the
-        // focus on the app, so this does not fire for the panel's own doings.
-        if (wasOurs && this.appRunning) this._dbus?.emit_signal('FocusedAnotherApp', null);
+        // The focus left the panel for another app: the app hides the panel.
+        if (wasOurs && this.appRunning) this._dbus.emit_signal('FocusedAnotherApp', null);
         if (window === this._lastTarget) return;
         this._forgetTarget();
         this._lastTarget = window;
@@ -299,13 +284,15 @@ export class ClipboardHelper {
         this._lastTargetUnmanagedId = 0;
     }
 
-    GetPasteTargetAsync(_parameters, invocation) {
-        if (!this._fromApp(invocation)) return;
+    _target() {
         const window = this._lastTarget;
         const app = window ? Shell.WindowTracker.get_default().get_window_app(window) : null;
-        invocation.return_value(new GLib.Variant('(sss)', [
-            app?.get_id() ?? '', window?.get_wm_class() ?? '', window?.get_title() ?? '',
-        ]));
+        return [app?.get_id() ?? '', window?.get_wm_class() ?? '', window?.get_title() ?? ''];
+    }
+
+    GetPasteTargetAsync(_parameters, invocation) {
+        if (!this._fromApp(invocation)) return;
+        invocation.return_value(new GLib.Variant('(sss)', this._target()));
     }
 
     PasteAsync([keys], invocation) {
@@ -324,13 +311,11 @@ export class ClipboardHelper {
         if (!keyvals || !target) return false;
 
         Main.activateWindow(target);
-        // Never type into a different app than the one meant: if it does not
-        // take the focus (it closed, or is on a locked screen), the clip stays
-        // on the clipboard for the user to paste.
+        // Never type into another app than the one meant: give up if the
+        // target does not take the focus in time.
         const deadline = GLib.get_monotonic_time() + FOCUS_WAIT_MS * 1000;
         while (global.display.focus_window !== target && GLib.get_monotonic_time() < deadline) await this._sleep(20);
         if (global.display.focus_window !== target) return false;
-        // Let the app settle its focus inside the window before the keys arrive.
         await this._sleep(60);
         this._press(keyvals);
         return true;
@@ -344,7 +329,6 @@ export class ClipboardHelper {
         return this._virtualKeyboard;
     }
 
-    /** Press the keys in order and let go of them in reverse, like a person would. */
     _press(keyvals) {
         const keyboard = this._keyboard();
         const now = () => GLib.get_monotonic_time();
@@ -358,19 +342,12 @@ export class ClipboardHelper {
         for (const keyval of [...keyvals].reverse()) keyboard.notify_keyval(now(), keyval, Clutter.KeyState.RELEASED);
     }
 
-    // ---- The shortcut and the menu --------------------------------------------
-
-    /** A token that lets the app's next window take the focus, as a launcher's would. */
+    // A token that lets the app's next window take the focus.
     _activationToken() {
-        try {
-            const context = global.create_app_launch_context(global.get_current_time(), -1);
-            const info = Gio.DesktopAppInfo.new(`${APP_ID}.desktop`);
-            return context.get_startup_notify_id(info, []) ?? '';
-        } catch (error) {
-            // Not installed with its .desktop file (a development build): the
-            // panel is brought to the front when it appears instead.
-            return '';
-        }
+        const info = this._appInfo();
+        if (!info) return '';
+        const context = global.create_app_launch_context(global.get_current_time(), -1);
+        return context.get_startup_notify_id(info, []) ?? '';
     }
 
     GetActivationTokenAsync(_parameters, invocation) {
@@ -384,20 +361,27 @@ export class ClipboardHelper {
             this._launchApp();
             return;
         }
-        this._dbus?.emit_signal('ShortcutPressed', new GLib.Variant('(s)', [this._activationToken()]));
+        this._dbus.emit_signal('ShortcutPressed', new GLib.Variant('(s)', [this._activationToken()]));
     }
 
-    /** From the top-bar icon: "show", "welcome", "start-at-login" or "quit". */
     activateMenu(action) {
         if (!this.appRunning) {
             if (action === 'show') this._launchApp();
             return;
         }
-        this._dbus?.emit_signal('MenuActivated', new GLib.Variant('(ss)', [action, this._activationToken()]));
+        this._dbus.emit_signal('MenuActivated', new GLib.Variant('(ss)', [action, this._activationToken()]));
+    }
+
+    // A package names the desktop file after the app; a snap names it after the
+    // snap, so that one is found by the window class it declares.
+    _appInfo() {
+        const apps = Shell.AppSystem.get_default();
+        const app = apps.lookup_app(`${APP_ID}.desktop`) ?? apps.lookup_startup_wmclass(APP_ID);
+        return app?.get_app_info();
     }
 
     _launchApp() {
-        const info = Gio.DesktopAppInfo.new(`${APP_ID}.desktop`);
+        const info = this._appInfo();
         if (!info) {
             Main.notify('Clipboard', 'The Clipboard app is not installed.');
             return;
@@ -423,13 +407,90 @@ export class ClipboardHelper {
         invocation.return_value(null);
     }
 
-    // ---- The app's windows ----------------------------------------------------
+    _startAsking() {
+        this._asking = new Gio.Cancellable();
+        this._ask(this._asking);
+    }
 
-    /**
-     * The app's windows come to the front when they open, as the user asked
-     * for them. The panel also floats above other windows, opens centred on
-     * the screen with the pointer, and afterwards where the user last put it.
-     */
+    _stopAsking() {
+        this._asking?.cancel();
+        this._asking = null;
+    }
+
+    // The app answers NextRequest only when it has a request, so the call
+    // stays open until then. It fails when the app quits, or at once when the
+    // app is not sandboxed; either ends the asking until the app starts again.
+    _ask(cancellable) {
+        Gio.DBus.session.call(APP_BUS_NAME, APP_OBJECT_PATH, APP_INTERFACE, 'NextRequest', null,
+            new GLib.VariantType('(usasay)'), Gio.DBusCallFlags.NO_AUTO_START, GLib.MAXINT32, cancellable,
+            (connection, result) => {
+                let request;
+                try {
+                    request = connection.call_finish(result);
+                } catch (error) {
+                    return;
+                }
+                if (cancellable.is_cancelled()) return;
+                this._ask(cancellable);
+                const [id, member, strings, data] = request.deepUnpack();
+                this._serve(member, strings, data).then(
+                    ([replyStrings, replyData]) => this._answer(cancellable, id, true, replyStrings, replyData),
+                    error => this._answer(cancellable, id, false, [error.message]));
+            });
+    }
+
+    // Returns [strings, bytes] for the reply.
+    async _serve(member, strings, data) {
+        switch (member) {
+        case 'GetVersion':
+            return [[String(PROTOCOL_VERSION)]];
+        case 'ReadClipboard':
+            return [[], await this._read(strings[0])];
+        case 'WriteClipboard':
+            this._write(strings[0], data);
+            return [[]];
+        case 'ClearClipboard':
+            this._clear();
+            return [[]];
+        case 'GetPasteTarget':
+            return [this._target()];
+        case 'Paste':
+            return [[String(await this._paste(strings[0]))]];
+        case 'GetShortcut':
+            return [this.GetShortcut()];
+        case 'SetShortcut':
+            this._settings.set_strv('show-panel', strings);
+            return [[]];
+        case 'SetMenuState': {
+            const state = {};
+            for (const entry of strings) {
+                const [key, value] = entry.split('=');
+                state[key] = value === 'true';
+            }
+            this._onMenuState(state);
+            return [[]];
+        }
+        case 'GetActivationToken':
+            return [[this._activationToken()]];
+        default:
+            throw new Error(`unknown request ${member}`);
+        }
+    }
+
+    _answer(cancellable, id, succeeded, strings, data = new GLib.Bytes(new Uint8Array(0))) {
+        if (cancellable.is_cancelled()) return;
+        const reply = GLib.Variant.new_tuple([
+            GLib.Variant.new_uint32(id),
+            GLib.Variant.new_boolean(succeeded),
+            GLib.Variant.new_strv(strings),
+            GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), data, true),
+        ]);
+        Gio.DBus.session.call(APP_BUS_NAME, APP_OBJECT_PATH, APP_INTERFACE, 'Reply', reply,
+            null, Gio.DBusCallFlags.NO_AUTO_START, -1, cancellable, null);
+    }
+
+    // The app's windows come to the front when they open. The panel also stays
+    // above other windows and opens centred, or where the user last put it.
     _onWindowCreated(window) {
         if (!this._isOurs(window)) return;
         const actor = window.get_compositor_private();
@@ -470,7 +531,6 @@ export class ClipboardHelper {
         window.move_frame(true, x, y);
     }
 
-    /** Whether the panel at this position would be on the work area. */
     _inside(position, frame, area) {
         return position.x >= area.x && position.y >= area.y &&
             position.x + frame.width <= area.x + area.width &&

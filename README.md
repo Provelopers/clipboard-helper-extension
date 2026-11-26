@@ -37,7 +37,7 @@ app, it also syncs your history to your account so your other devices have it.
 
 ## Supported versions
 
-GNOME Shell 46 (Ubuntu 24.04).
+GNOME Shell 46 (Ubuntu 24.04) and 50 (Ubuntu 26.04).
 
 ## The D-Bus interface
 
@@ -48,7 +48,7 @@ paste, shortcut and menu calls are answered only for whoever holds that name.
 
 | Method | |
 |---|---|
-| `GetVersion() → u` | The protocol version, 1. |
+| `GetVersion() → u` | The protocol version, 2 (1 had no asking of a sandboxed app). |
 | `ReadClipboard(s mimeType) → ay` | The clipboard in one format. |
 | `WriteClipboard(s mimeType, ay data)` | Put content on the clipboard. Not announced back as a copy. |
 | `ClearClipboard()` | |
@@ -57,6 +57,22 @@ paste, shortcut and menu calls are answered only for whoever holds that name.
 | `GetShortcut() → as`, `SetShortcut(as)` | The panel's shortcut, as GTK accelerators. |
 | `SetMenuState(a{sv})` | `startAtLogin` (b) and `welcome` (b), shown in the menu. |
 | `GetActivationToken() → s` | Lets the app's next window take the focus. |
+
+### A sandboxed app (the snap)
+
+The app installed as a snap may answer calls on the session bus but not make
+them, so it cannot call the methods above. For it the direction is turned
+round: the helper calls the app's own object, `/com/provelopers/Clipboard/App`
+(interface `com.provelopers.Clipboard.App1`), on the name
+`com.provelopers.Clipboard.App`, as soon as that name appears.
+
+| Method on the app | |
+|---|---|
+| `NextRequest() → (u id, s member, as strings, ay data)` | Answered only when the app wants something: one of the methods above by name, with its arguments as strings and bytes. The helper asks again at once. An app that is not sandboxed has no such object, and the helper stops asking. |
+| `Reply(u id, b succeeded, as strings, ay data)` | The result of request `id`; when it failed, the reason is the first string. |
+
+What can be asked for is exactly the list of methods above, and nothing is
+handed to anyone but the holder of the app's name.
 
 | Signal | |
 |---|---|

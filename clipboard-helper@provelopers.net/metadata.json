@@ -3,9 +3,10 @@
   "name": "Clipboard Helper",
   "description": "Companion for the Clipboard app (a clipboard history manager). It does nothing unless the Clipboard app is installed.\n\nThis extension reads your clipboard: while the Clipboard app is running, it tells the app about each copy so the app can keep it in your history. The extension passes clipboard content only to the Clipboard app on this computer, over D-Bus, and sends nothing online itself. The Clipboard app keeps your history on this computer; if you sign in to the app, it also syncs your history to your account so your other devices have it.\n\nIt also opens the app's panel with a keyboard shortcut once you choose one in the app (none is set until then), pastes the item you pick into the app you were in, and shows the app's icon in the top bar while the app runs.",
   "shell-version": [
-    "46"
+    "46",
+    "50"
   ],
   "settings-schema": "org.gnome.shell.extensions.clipboard-helper",
   "url": "https://github.com/Provelopers/clipboard-helper-extension",
-  "version-name": "1.0"
+  "version-name": "2.0"
 }
